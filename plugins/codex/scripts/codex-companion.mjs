@@ -77,6 +77,9 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs plan-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs spec-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs pr-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -235,10 +238,18 @@ async function handleSetup(argv) {
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
-function buildAdversarialReviewPrompt(context, focusText) {
-  const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
+const REVIEW_TEMPLATE_MAP = new Map([
+  ["Adversarial Review", "adversarial-review"],
+  ["Plan Review", "plan-review"],
+  ["Spec Review", "spec-review"],
+  ["PR Review", "pr-review"]
+]);
+
+function buildCustomReviewPrompt(context, focusText, reviewName) {
+  const templateName = REVIEW_TEMPLATE_MAP.get(reviewName) ?? "adversarial-review";
+  const template = loadPromptTemplate(ROOT_DIR, templateName);
   return interpolateTemplate(template, {
-    REVIEW_KIND: "Adversarial Review",
+    REVIEW_KIND: reviewName,
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
@@ -404,7 +415,7 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
+  const prompt = buildCustomReviewPrompt(context, focusText, reviewName);
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
@@ -527,8 +538,15 @@ async function executeTaskRun(request) {
 }
 
 function buildReviewJobMetadata(reviewName, target) {
+  const kindMap = {
+    "Adversarial Review": "adversarial-review",
+    "Plan Review": "plan-review",
+    "Spec Review": "spec-review",
+    "PR Review": "pr-review"
+  };
+  const kind = kindMap[reviewName] ?? "review";
   return {
-    kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
+    kind,
     title: reviewName === "Review" ? "Codex Review" : `Codex ${reviewName}`,
     summary: `${reviewName} ${target.label}`
   };
@@ -996,6 +1014,15 @@ async function main() {
       await handleReviewCommand(argv, {
         reviewName: "Adversarial Review"
       });
+      break;
+    case "plan-review":
+      await handleReviewCommand(argv, { reviewName: "Plan Review" });
+      break;
+    case "spec-review":
+      await handleReviewCommand(argv, { reviewName: "Spec Review" });
+      break;
+    case "pr-review":
+      await handleReviewCommand(argv, { reviewName: "PR Review" });
       break;
     case "task":
       await handleTask(argv);
