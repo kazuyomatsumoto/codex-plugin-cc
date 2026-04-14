@@ -53,8 +53,7 @@ test("plan-review fails when .claude/plans/ directory is absent", () => {
   const result = runPlanReview(dir, buildEnv(binDir));
 
   assert.notEqual(result.status, 0);
-  const out = result.stderr + result.stdout;
-  assert.match(out, /No plan file found/i);
+  assert.match(result.stderr + result.stdout, /No plan file found/i);
 });
 
 test("plan-review fails when .claude/plans/ is empty", () => {
@@ -76,7 +75,35 @@ test("plan-review fails when --plan names a nonexistent file", () => {
   const result = runPlanReview(dir, buildEnv(binDir), "--plan", "nonexistent.md");
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr + result.stdout, /No plan file found/i);
+  assert.match(result.stderr + result.stdout, /Plan file not found/i);
+});
+
+test("plan-review fails with actionable error when multiple plans exist and --plan is omitted", () => {
+  const dir = makeProjectDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  writePlan(dir, "first.md", "# First");
+  writePlan(dir, "second.md", "# Second");
+
+  const result = runPlanReview(dir, buildEnv(binDir));
+
+  assert.notEqual(result.status, 0);
+  const out = result.stderr + result.stdout;
+  assert.match(out, /Multiple plan files/i);
+  assert.match(out, /--plan <path>/);
+});
+
+test("plan-review rejects positional text that looks like a path", () => {
+  const dir = makeProjectDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  writePlan(dir, "ok.md", "# OK");
+
+  const result = runPlanReview(dir, buildEnv(binDir), "some-plan.md");
+
+  assert.notEqual(result.status, 0);
+  const out = result.stderr + result.stdout;
+  assert.match(out, /Use --plan <path>/);
 });
 
 test("plan-review fails when plan file is empty", () => {
@@ -162,25 +189,33 @@ test("plan-review picks the only plan file when --plan is omitted", () => {
   assert.match(planDoc, /the-plan\.md/);
 });
 
-test("plan-review picks newest plan when multiple exist", () => {
+test("plan-review with --plan succeeds even when multiple plans exist", () => {
   const dir = makeProjectDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
+  writePlan(dir, "first.md", "# First Plan");
+  writePlan(dir, "second.md", "# Second Plan");
 
-  const older = writePlan(dir, "a-old.md", "# Old Plan");
-  const newer = writePlan(dir, "b-new.md", "# New Plan");
+  // Explicit selection works even with multiple candidates
+  const result = runPlanReview(dir, buildEnv(binDir), "--plan", "second.md");
 
-  const now = Date.now();
-  fs.utimesSync(older, new Date(now - 5000), new Date(now - 5000));
-  fs.utimesSync(newer, new Date(now), new Date(now));
+  assert.equal(result.status, 0, result.stderr);
+  const planDoc = getPlanDocumentSection(readFakeCodexState(binDir).lastTurnStart.prompt);
+  assert.match(planDoc, /Second Plan/);
+  assert.doesNotMatch(planDoc, /First Plan/);
+});
+
+test("plan-review echoes the resolved plan path to stderr", () => {
+  const dir = makeProjectDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  writePlan(dir, "my-plan.md", "# My Plan");
 
   const result = runPlanReview(dir, buildEnv(binDir));
 
   assert.equal(result.status, 0, result.stderr);
-  const state = readFakeCodexState(binDir);
-  const planDoc = getPlanDocumentSection(state.lastTurnStart.prompt);
-  assert.match(planDoc, /New Plan/);
-  assert.doesNotMatch(planDoc, /Old Plan/);
+  // The resolved path must appear in stderr so users can verify what was reviewed
+  assert.match(result.stderr, /\[plan-review\] Selected plan: .+my-plan\.md/);
 });
 
 test("plan-review resolves --plan bare filename", () => {

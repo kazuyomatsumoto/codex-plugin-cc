@@ -719,18 +719,12 @@ function resolvePlanFile(cwd, focusText) {
   // Resolve symlinks for reliable path-safety comparison (e.g., /tmp → /private/tmp on macOS)
   const realPlansDir = fs.existsSync(plansDir) ? fs.realpathSync(plansDir) : plansDir;
 
-  function findInDir(dir) {
-    if (!fs.existsSync(dir)) return null;
-    const entries = fs.readdirSync(dir)
+  function listMarkdownEntries(dir) {
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
       .filter((f) => f.endsWith(".md"))
-      .map((f) => {
-        const abs = path.join(dir, f);
-        const stat = fs.statSync(abs);
-        return { abs, f, mtimeMs: stat.mtimeMs };
-      });
-    if (entries.length === 0) return null;
-    entries.sort((a, b) => b.mtimeMs - a.mtimeMs || a.f.localeCompare(b.f));
-    return entries[0].abs;
+      .map((f) => ({ abs: path.join(dir, f), f }))
+      .sort((a, b) => a.f.localeCompare(b.f));
   }
 
   function resolveCandidate(p) {
@@ -740,6 +734,7 @@ function resolvePlanFile(cwd, focusText) {
 
   let candidate;
   if (focusText) {
+    // Explicit --plan <value>: absolute path, relative path, or bare filename.
     if (path.isAbsolute(focusText)) {
       candidate = resolveCandidate(focusText);
     } else if (focusText.includes(path.sep) || focusText.includes("/")) {
@@ -747,14 +742,28 @@ function resolvePlanFile(cwd, focusText) {
     } else {
       candidate = resolveCandidate(path.join(plansDir, focusText));
     }
+    if (!candidate) {
+      throw new Error(
+        `Plan file not found: ${focusText}. Expected under ${plansDir} or as an absolute path.`
+      );
+    }
   } else {
-    candidate = findInDir(plansDir);
-  }
-
-  if (!candidate) {
-    throw new Error(
-      "No plan file found. Place a plan in <project>/.claude/plans/ or pass a path: /codex:plan-review <path>"
-    );
+    // Auto-select: exactly one .md file must exist. Fail-closed on 0 or 2+ to avoid silent
+    // mis-selection by mtime heuristics.
+    const entries = listMarkdownEntries(plansDir);
+    if (entries.length === 0) {
+      throw new Error(
+        `No plan file found in ${plansDir}. Create a plan there or pass --plan <path>.`
+      );
+    }
+    if (entries.length > 1) {
+      const names = entries.map((e) => e.f).join(", ");
+      throw new Error(
+        `Multiple plan files found in ${plansDir} (${names}). ` +
+        `Use --plan <path> to select one explicitly.`
+      );
+    }
+    candidate = entries[0].abs;
   }
 
   const resolved = fs.realpathSync(candidate);
@@ -796,8 +805,17 @@ async function handleReviewCommand(argv, config) {
 
   let planFile = null;
   if (config.reviewName === "Plan Review") {
+    // Detect likely misuse: positional text shaped like a path (deprecated positional API).
+    if (focusText && (focusText.endsWith(".md") || focusText.includes("/") || focusText.includes(path.sep))) {
+      throw new Error(
+        `Positional text "${focusText}" looks like a plan path. ` +
+        `Use --plan <path> to select a plan. Positional text is review focus only.`
+      );
+    }
     // focusText is always review focus text. Use --plan <path> to select a specific plan.
     planFile = resolvePlanFile(cwd, options.plan ?? null);
+    // Surface the resolved plan path so users can verify what will be reviewed.
+    process.stderr.write(`[plan-review] Selected plan: ${planFile.path}\n`);
   }
 
   const target = resolveReviewTarget(cwd, {
