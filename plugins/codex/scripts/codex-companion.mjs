@@ -759,8 +759,14 @@ function resolvePlanFile(cwd, focusText) {
 
   const resolved = fs.realpathSync(candidate);
   const isSafe = resolved === realPlansDir || resolved.startsWith(realPlansDir + path.sep);
-  if (!isSafe && !path.isAbsolute(focusText ?? "")) {
-    throw new Error(`Plan file path is outside allowed directories: ${resolved}`);
+  if (!isSafe) {
+    throw new Error(
+      `Plan file path is outside allowed directories: ${resolved}. ` +
+      `Plans must live under ${plansDir}.`
+    );
+  }
+  if (!resolved.endsWith(".md")) {
+    throw new Error(`Plan file must be a .md file: ${resolved}`);
   }
 
   const stat = fs.statSync(resolved);
@@ -777,7 +783,7 @@ function resolvePlanFile(cwd, focusText) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "plan"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -790,7 +796,8 @@ async function handleReviewCommand(argv, config) {
 
   let planFile = null;
   if (config.reviewName === "Plan Review") {
-    planFile = resolvePlanFile(cwd, focusText || null);
+    // focusText is always review focus text. Use --plan <path> to select a specific plan.
+    planFile = resolvePlanFile(cwd, options.plan ?? null);
   }
 
   const target = resolveReviewTarget(cwd, {

@@ -24,7 +24,11 @@ function writePlan(dir, name, content = "# Plan\n\nStep 1: do the thing.") {
 }
 
 function runPlanReview(cwd, env, ...extraArgs) {
-  return run("node", [SCRIPT, "plan-review", "--wait", "--scope", "working-tree", "--cwd", cwd, ...extraArgs], { cwd, env });
+  return run(
+    "node",
+    [SCRIPT, "plan-review", "--wait", "--scope", "working-tree", "--cwd", cwd, ...extraArgs],
+    { cwd, env }
+  );
 }
 
 function readFakeCodexState(binDir) {
@@ -33,7 +37,12 @@ function readFakeCodexState(binDir) {
   return JSON.parse(fs.readFileSync(statePath, "utf8"));
 }
 
-// --- Error path tests (no Codex needed) ---
+function getPlanDocumentSection(prompt) {
+  const match = prompt.match(/<plan_document>\n([\s\S]*?)\n<\/plan_document>/);
+  return match ? match[1] : null;
+}
+
+// --- Error path tests ---
 
 test("plan-review fails when .claude/plans/ directory is absent", () => {
   const dir = makeTempDir();
@@ -45,7 +54,7 @@ test("plan-review fails when .claude/plans/ directory is absent", () => {
 
   assert.notEqual(result.status, 0);
   const out = result.stderr + result.stdout;
-  assert.match(out, /\.claude\/plans/);
+  assert.match(out, /No plan file found/i);
 });
 
 test("plan-review fails when .claude/plans/ is empty", () => {
@@ -56,20 +65,18 @@ test("plan-review fails when .claude/plans/ is empty", () => {
   const result = runPlanReview(dir, buildEnv(binDir));
 
   assert.notEqual(result.status, 0);
-  const out = result.stderr + result.stdout;
-  assert.match(out, /No plan file found/i);
+  assert.match(result.stderr + result.stdout, /No plan file found/i);
 });
 
-test("plan-review fails when named plan file does not exist", () => {
+test("plan-review fails when --plan names a nonexistent file", () => {
   const dir = makeProjectDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
 
-  const result = runPlanReview(dir, buildEnv(binDir), "nonexistent.md");
+  const result = runPlanReview(dir, buildEnv(binDir), "--plan", "nonexistent.md");
 
   assert.notEqual(result.status, 0);
-  const out = result.stderr + result.stdout;
-  assert.match(out, /No plan file found/i);
+  assert.match(result.stderr + result.stdout, /No plan file found/i);
 });
 
 test("plan-review fails when plan file is empty", () => {
@@ -81,8 +88,7 @@ test("plan-review fails when plan file is empty", () => {
   const result = runPlanReview(dir, buildEnv(binDir));
 
   assert.notEqual(result.status, 0);
-  const out = result.stderr + result.stdout;
-  assert.match(out, /empty/i);
+  assert.match(result.stderr + result.stdout, /empty/i);
 });
 
 test("plan-review fails when plan file exceeds 200 KB", () => {
@@ -94,40 +100,66 @@ test("plan-review fails when plan file exceeds 200 KB", () => {
   const result = runPlanReview(dir, buildEnv(binDir));
 
   assert.notEqual(result.status, 0);
-  const out = result.stderr + result.stdout;
-  assert.match(out, /too large/i);
+  assert.match(result.stderr + result.stdout, /too large/i);
 });
 
-test("plan-review rejects directory traversal in focusText", () => {
+test("plan-review rejects traversal via --plan", () => {
   const dir = makeProjectDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   writePlan(dir, "ok.md");
 
-  const result = runPlanReview(dir, buildEnv(binDir), "../../etc/passwd");
+  const result = runPlanReview(dir, buildEnv(binDir), "--plan", "../../etc/passwd");
 
-  // Either fails to find the file or rejects as unsafe
   assert.notEqual(result.status, 0);
 });
 
-// --- Success path tests (requires fake Codex) ---
-
-test("plan-review picks the only plan file when focusText is empty", () => {
+test("plan-review rejects absolute path outside plans directory", () => {
   const dir = makeProjectDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
-  const PLAN_CONTENT = "# My Only Plan\n\nThis is the plan content.";
-  writePlan(dir, "the-plan.md", PLAN_CONTENT);
+  writePlan(dir, "ok.md");
+  // Write a file outside the plans dir
+  const outsidePath = path.join(dir, "outside.md");
+  fs.writeFileSync(outsidePath, "# Outside Plan", "utf8");
+
+  const result = runPlanReview(dir, buildEnv(binDir), "--plan", outsidePath);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr + result.stdout, /outside allowed directories/i);
+});
+
+test("plan-review rejects non-.md file via --plan", () => {
+  const dir = makeProjectDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  // Create a non-markdown file inside plans dir
+  const plansDir = path.join(dir, ".claude", "plans");
+  const txtPath = path.join(plansDir, "plan.txt");
+  fs.writeFileSync(txtPath, "not markdown", "utf8");
+
+  const result = runPlanReview(dir, buildEnv(binDir), "--plan", txtPath);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr + result.stdout, /must be a \.md file/i);
+});
+
+// --- Success path tests ---
+
+test("plan-review picks the only plan file when --plan is omitted", () => {
+  const dir = makeProjectDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  writePlan(dir, "the-plan.md", "# My Only Plan\n\nThis is the plan content.");
 
   const result = runPlanReview(dir, buildEnv(binDir));
 
   assert.equal(result.status, 0, result.stderr);
   const state = readFakeCodexState(binDir);
-  assert.ok(state?.lastTurnStart?.prompt, "fake Codex should record lastTurnStart");
-  assert.match(state.lastTurnStart.prompt, /My Only Plan/);
-  assert.match(state.lastTurnStart.prompt, /the-plan\.md/);
-  // Must NOT contain stale design.md or unrelated paths
-  assert.doesNotMatch(state.lastTurnStart.prompt, /design\.md/);
+  const planDoc = getPlanDocumentSection(state.lastTurnStart.prompt);
+  assert.ok(planDoc, "plan_document section should exist");
+  assert.match(planDoc, /My Only Plan/);
+  assert.match(planDoc, /the-plan\.md/);
 });
 
 test("plan-review picks newest plan when multiple exist", () => {
@@ -138,7 +170,6 @@ test("plan-review picks newest plan when multiple exist", () => {
   const older = writePlan(dir, "a-old.md", "# Old Plan");
   const newer = writePlan(dir, "b-new.md", "# New Plan");
 
-  // Ensure newer has a later mtime
   const now = Date.now();
   fs.utimesSync(older, new Date(now - 5000), new Date(now - 5000));
   fs.utimesSync(newer, new Date(now), new Date(now));
@@ -147,49 +178,64 @@ test("plan-review picks newest plan when multiple exist", () => {
 
   assert.equal(result.status, 0, result.stderr);
   const state = readFakeCodexState(binDir);
-  const prompt = state.lastTurnStart.prompt;
-  // Extract plan_document section to verify only the newer plan is selected
-  const planDocMatch = prompt.match(/<plan_document>\n([\s\S]*?)\n<\/plan_document>/);
-  assert.ok(planDocMatch, "plan_document section should exist in prompt");
-  assert.match(planDocMatch[1], /New Plan/);
-  assert.doesNotMatch(planDocMatch[1], /Old Plan/);
+  const planDoc = getPlanDocumentSection(state.lastTurnStart.prompt);
+  assert.match(planDoc, /New Plan/);
+  assert.doesNotMatch(planDoc, /Old Plan/);
 });
 
-test("plan-review resolves bare filename from focusText", () => {
+test("plan-review resolves --plan bare filename", () => {
   const dir = makeProjectDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   writePlan(dir, "specific.md", "# Specific Plan\n\nSelected by name.");
 
-  const result = runPlanReview(dir, buildEnv(binDir), "specific.md");
+  const result = runPlanReview(dir, buildEnv(binDir), "--plan", "specific.md");
 
   assert.equal(result.status, 0, result.stderr);
   const state = readFakeCodexState(binDir);
-  assert.match(state.lastTurnStart.prompt, /Specific Plan/);
+  assert.match(getPlanDocumentSection(state.lastTurnStart.prompt), /Specific Plan/);
 });
 
-test("plan-review resolves explicit relative path from focusText", () => {
+test("plan-review resolves --plan with explicit relative path", () => {
   const dir = makeProjectDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   writePlan(dir, "rel.md", "# Relative Path Plan");
   const relPath = path.join(".claude", "plans", "rel.md");
 
-  const result = runPlanReview(dir, buildEnv(binDir), relPath);
+  const result = runPlanReview(dir, buildEnv(binDir), "--plan", relPath);
 
   assert.equal(result.status, 0, result.stderr);
   const state = readFakeCodexState(binDir);
-  assert.match(state.lastTurnStart.prompt, /Relative Path Plan/);
+  assert.match(getPlanDocumentSection(state.lastTurnStart.prompt), /Relative Path Plan/);
 });
 
+test("plan-review passes positional text as review focus (USER_FOCUS), not as plan path", () => {
+  const dir = makeProjectDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  writePlan(dir, "my-plan.md", "# My Plan");
+
+  // Pass natural-language focus text as positional args
+  const result = runPlanReview(dir, buildEnv(binDir), "focus on rollback risks");
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = readFakeCodexState(binDir);
+  const prompt = state.lastTurnStart.prompt;
+  // Plan document should contain the plan content
+  assert.match(getPlanDocumentSection(prompt), /My Plan/);
+  // Focus text should appear in the USER_FOCUS section
+  assert.match(prompt, /User focus: focus on rollback risks/);
+});
+
+// --- Shadow / regression tests ---
+
 test("plan-review in project mode ignores nested .claude/.claude/plans shadow", () => {
-  // Regression test: ensure we never look at {cwd}/.claude/.claude/plans even if it exists
   const dir = makeProjectDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
 
   writePlan(dir, "real.md", "# Real Plan");
-  // Shadow directory with a stale file
   const shadow = path.join(dir, ".claude", ".claude", "plans");
   fs.mkdirSync(shadow, { recursive: true });
   fs.writeFileSync(path.join(shadow, "stale.md"), "# Stale Plan", "utf8");
@@ -197,9 +243,41 @@ test("plan-review in project mode ignores nested .claude/.claude/plans shadow", 
   const result = runPlanReview(dir, buildEnv(binDir));
 
   assert.equal(result.status, 0, result.stderr);
-  const state = readFakeCodexState(binDir);
-  const planDocMatch = state.lastTurnStart.prompt.match(/<plan_document>\n([\s\S]*?)\n<\/plan_document>/);
-  assert.ok(planDocMatch, "plan_document section should exist");
-  assert.match(planDocMatch[1], /Real Plan/);
-  assert.doesNotMatch(planDocMatch[1], /Stale Plan/);
+  const planDoc = getPlanDocumentSection(readFakeCodexState(binDir).lastTurnStart.prompt);
+  assert.match(planDoc, /Real Plan/);
+  assert.doesNotMatch(planDoc, /Stale Plan/);
+});
+
+test("plan-review in conductor mode uses ~/.claude/plans, not {cwd}/.claude/.claude/plans", () => {
+  // Mock HOME so os.homedir() returns a temp dir
+  const fakeHome = makeTempDir();
+  const conductorCwd = path.join(fakeHome, ".claude");
+  const globalPlansDir = path.join(conductorCwd, "plans");
+  const shadowDir = path.join(conductorCwd, ".claude", "plans");
+
+  fs.mkdirSync(globalPlansDir, { recursive: true });
+  fs.writeFileSync(path.join(globalPlansDir, "canonical.md"), "# Canonical Conductor Plan", "utf8");
+
+  fs.mkdirSync(shadowDir, { recursive: true });
+  fs.writeFileSync(path.join(shadowDir, "shadow.md"), "# Shadow Plan", "utf8");
+
+  initGitRepo(conductorCwd);
+
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const baseEnv = buildEnv(binDir);
+  const env = { ...baseEnv, HOME: fakeHome };
+
+  const result = run(
+    "node",
+    [SCRIPT, "plan-review", "--wait", "--scope", "working-tree", "--cwd", conductorCwd],
+    { cwd: conductorCwd, env }
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const planDoc = getPlanDocumentSection(readFakeCodexState(binDir).lastTurnStart.prompt);
+  assert.ok(planDoc, "plan_document section should exist");
+  assert.match(planDoc, /Canonical Conductor Plan/);
+  assert.doesNotMatch(planDoc, /Shadow Plan/);
 });
