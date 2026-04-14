@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -245,15 +246,19 @@ const REVIEW_TEMPLATE_MAP = new Map([
   ["PR Review", "pr-review"]
 ]);
 
-function buildCustomReviewPrompt(context, focusText, reviewName) {
+function buildCustomReviewPrompt(context, focusText, reviewName, planFile = null) {
   const templateName = REVIEW_TEMPLATE_MAP.get(reviewName) ?? "adversarial-review";
   const template = loadPromptTemplate(ROOT_DIR, templateName);
+  const planFileContent = planFile
+    ? `Path: ${planFile.path}\n\n${planFile.content}`
+    : "";
   return interpolateTemplate(template, {
     REVIEW_KIND: reviewName,
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
-    REVIEW_INPUT: context.content
+    REVIEW_INPUT: context.content,
+    PLAN_FILE_CONTENT: planFileContent
   });
 }
 
@@ -373,6 +378,7 @@ async function executeReviewRun(request) {
   });
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
+  const planFile = request.planFile ?? null;
   if (reviewName === "Review") {
     const reviewTarget = validateNativeReviewRequest(target, focusText);
     const result = await runAppServerReview(request.cwd, {
@@ -415,7 +421,7 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildCustomReviewPrompt(context, focusText, reviewName);
+  const prompt = buildCustomReviewPrompt(context, focusText, reviewName, planFile);
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
@@ -697,6 +703,83 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
 }
 
+const PLAN_SIZE_LIMIT = 200 * 1024;
+
+function resolvePlanFile(cwd, focusText) {
+  const home = os.homedir();
+  const conductorCwd = path.resolve(home, ".claude");
+  const isConductorCwd = path.resolve(cwd) === conductorCwd;
+
+  const projectPlansDir = path.join(cwd, ".claude", "plans");
+  const globalPlansDir = path.join(conductorCwd, "plans");
+  // Resolve symlinks for reliable path-safety comparison (e.g., /tmp → /private/tmp on macOS)
+  const realProjectPlansDir = fs.existsSync(projectPlansDir) ? fs.realpathSync(projectPlansDir) : projectPlansDir;
+  const realGlobalPlansDir = fs.existsSync(globalPlansDir) ? fs.realpathSync(globalPlansDir) : globalPlansDir;
+
+  function findInDir(dir) {
+    if (!fs.existsSync(dir)) return null;
+    const entries = fs.readdirSync(dir)
+      .filter((f) => f.endsWith(".md"))
+      .map((f) => {
+        const abs = path.join(dir, f);
+        const stat = fs.statSync(abs);
+        return { abs, f, mtimeMs: stat.mtimeMs };
+      });
+    if (entries.length === 0) return null;
+    entries.sort((a, b) => b.mtimeMs - a.mtimeMs || a.f.localeCompare(b.f));
+    return entries[0].abs;
+  }
+
+  function resolveCandidate(p) {
+    if (!fs.existsSync(p)) return null;
+    return p;
+  }
+
+  let candidate;
+  if (focusText) {
+    if (path.isAbsolute(focusText)) {
+      candidate = resolveCandidate(focusText);
+    } else if (focusText.includes(path.sep) || focusText.includes("/")) {
+      candidate = resolveCandidate(path.resolve(cwd, focusText));
+    } else {
+      candidate =
+        resolveCandidate(path.join(projectPlansDir, focusText)) ??
+        (isConductorCwd ? resolveCandidate(path.join(globalPlansDir, focusText)) : null);
+    }
+  } else {
+    candidate = findInDir(projectPlansDir);
+    if (!candidate && isConductorCwd) {
+      candidate = findInDir(globalPlansDir);
+    }
+  }
+
+  if (!candidate) {
+    throw new Error(
+      "No plan file found. Place a plan in <project>/.claude/plans/ or pass a path: /codex:plan-review <path>"
+    );
+  }
+
+  const resolved = fs.realpathSync(candidate);
+  const allowedPrefixes = [realProjectPlansDir, realGlobalPlansDir];
+  const isSafe = allowedPrefixes.some(
+    (prefix) => resolved === prefix || resolved.startsWith(prefix + path.sep)
+  );
+  if (!isSafe && !path.isAbsolute(focusText ?? "")) {
+    throw new Error(`Plan file path is outside allowed directories: ${resolved}`);
+  }
+
+  const stat = fs.statSync(resolved);
+  if (stat.size === 0) {
+    throw new Error(`Plan file is empty: ${resolved}`);
+  }
+  if (stat.size > PLAN_SIZE_LIMIT) {
+    throw new Error(`Plan file too large (${stat.size} bytes > ${PLAN_SIZE_LIMIT / 1024} KB limit): ${resolved}`);
+  }
+
+  const content = fs.readFileSync(resolved, "utf8");
+  return { path: resolved, content };
+}
+
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["base", "scope", "model", "cwd"],
@@ -709,6 +792,12 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const focusText = positionals.join(" ").trim();
+
+  let planFile = null;
+  if (config.reviewName === "Plan Review") {
+    planFile = resolvePlanFile(cwd, focusText || null);
+  }
+
   const target = resolveReviewTarget(cwd, {
     base: options.base,
     scope: options.scope
@@ -733,6 +822,7 @@ async function handleReviewCommand(argv, config) {
         scope: options.scope,
         model: options.model,
         focusText,
+        planFile,
         reviewName: config.reviewName,
         onProgress: progress
       }),

@@ -5,13 +5,15 @@ You are reviewing a plan written or validated by Claude — your value is provid
 </role>
 
 <task>
-Review the implementation plan provided in the repository context below.
+Review the implementation plan provided below.
 Target: {{TARGET_LABEL}}
 User focus: {{USER_FOCUS}}
 
-If the repository context below is empty or does not contain the target plan document,
-use the Read tool to load the file(s) referenced in the user focus text.
-Common plan locations: .claude/plans/, .tmp/design.md, docs/plans/.
+<plan_document>
+{{PLAN_FILE_CONTENT}}
+</plan_document>
+
+Do not search the filesystem for plan files. Review only the plan document above.
 </task>
 
 <review_axes>
@@ -55,6 +57,7 @@ Every finding must include a concrete recommendation the author can act on immed
 Every finding must be defensible from the provided plan content or repository context.
 Do not invent requirements, constraints, dependencies, or deadlines not present in the plan.
 If a conclusion depends on an inference, state that explicitly in the finding body and keep the confidence honest.
+Do not use Read, Bash, or other tools to load files not already provided in the plan_document block above.
 </grounding_rules>
 
 <calibration_rules>
