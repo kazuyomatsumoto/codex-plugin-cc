@@ -710,11 +710,14 @@ function resolvePlanFile(cwd, focusText) {
   const conductorCwd = path.resolve(home, ".claude");
   const isConductorCwd = path.resolve(cwd) === conductorCwd;
 
-  const projectPlansDir = path.join(cwd, ".claude", "plans");
-  const globalPlansDir = path.join(conductorCwd, "plans");
+  // Conductor mode (cwd == ~/.claude) uses ~/.claude/plans/ exclusively.
+  // Project mode uses {cwd}/.claude/plans/ exclusively.
+  // Each mode has a single canonical plans directory to prevent nested-dir shadowing.
+  const plansDir = isConductorCwd
+    ? path.join(conductorCwd, "plans")
+    : path.join(cwd, ".claude", "plans");
   // Resolve symlinks for reliable path-safety comparison (e.g., /tmp → /private/tmp on macOS)
-  const realProjectPlansDir = fs.existsSync(projectPlansDir) ? fs.realpathSync(projectPlansDir) : projectPlansDir;
-  const realGlobalPlansDir = fs.existsSync(globalPlansDir) ? fs.realpathSync(globalPlansDir) : globalPlansDir;
+  const realPlansDir = fs.existsSync(plansDir) ? fs.realpathSync(plansDir) : plansDir;
 
   function findInDir(dir) {
     if (!fs.existsSync(dir)) return null;
@@ -742,15 +745,10 @@ function resolvePlanFile(cwd, focusText) {
     } else if (focusText.includes(path.sep) || focusText.includes("/")) {
       candidate = resolveCandidate(path.resolve(cwd, focusText));
     } else {
-      candidate =
-        resolveCandidate(path.join(projectPlansDir, focusText)) ??
-        (isConductorCwd ? resolveCandidate(path.join(globalPlansDir, focusText)) : null);
+      candidate = resolveCandidate(path.join(plansDir, focusText));
     }
   } else {
-    candidate = findInDir(projectPlansDir);
-    if (!candidate && isConductorCwd) {
-      candidate = findInDir(globalPlansDir);
-    }
+    candidate = findInDir(plansDir);
   }
 
   if (!candidate) {
@@ -760,10 +758,7 @@ function resolvePlanFile(cwd, focusText) {
   }
 
   const resolved = fs.realpathSync(candidate);
-  const allowedPrefixes = [realProjectPlansDir, realGlobalPlansDir];
-  const isSafe = allowedPrefixes.some(
-    (prefix) => resolved === prefix || resolved.startsWith(prefix + path.sep)
-  );
+  const isSafe = resolved === realPlansDir || resolved.startsWith(realPlansDir + path.sep);
   if (!isSafe && !path.isAbsolute(focusText ?? "")) {
     throw new Error(`Plan file path is outside allowed directories: ${resolved}`);
   }

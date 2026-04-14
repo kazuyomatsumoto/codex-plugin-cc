@@ -181,3 +181,25 @@ test("plan-review resolves explicit relative path from focusText", () => {
   const state = readFakeCodexState(binDir);
   assert.match(state.lastTurnStart.prompt, /Relative Path Plan/);
 });
+
+test("plan-review in project mode ignores nested .claude/.claude/plans shadow", () => {
+  // Regression test: ensure we never look at {cwd}/.claude/.claude/plans even if it exists
+  const dir = makeProjectDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  writePlan(dir, "real.md", "# Real Plan");
+  // Shadow directory with a stale file
+  const shadow = path.join(dir, ".claude", ".claude", "plans");
+  fs.mkdirSync(shadow, { recursive: true });
+  fs.writeFileSync(path.join(shadow, "stale.md"), "# Stale Plan", "utf8");
+
+  const result = runPlanReview(dir, buildEnv(binDir));
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = readFakeCodexState(binDir);
+  const planDocMatch = state.lastTurnStart.prompt.match(/<plan_document>\n([\s\S]*?)\n<\/plan_document>/);
+  assert.ok(planDocMatch, "plan_document section should exist");
+  assert.match(planDocMatch[1], /Real Plan/);
+  assert.doesNotMatch(planDocMatch[1], /Stale Plan/);
+});
