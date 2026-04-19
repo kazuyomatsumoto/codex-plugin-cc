@@ -1,6 +1,6 @@
 ---
 description: Run a Codex cross-provider plan review for optimism bias and feasibility gaps
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--plan <path>] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -32,7 +32,9 @@ Argument handling:
 - The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
 - `/codex:plan-review` uses the same review target selection as `/codex:adversarial-review`.
 - It supports working-tree review, branch review, and `--base <ref>`.
-- It can take extra focus text after the flags to specify the plan file path or review focus.
+- Use `--plan <path>` to select a specific plan file (absolute or relative, must live under `.claude/plans/`). Omit only when exactly one plan file exists in `.claude/plans/` (or `~/.claude/plans/` in conductor mode); multiple files require explicit `--plan`.
+- Any positional text after the flags is passed to Codex as review focus text — it is NOT interpreted as a plan file path. Path-like positional arguments (e.g. `foo.md` or `dir/bar`) are rejected with guidance to use `--plan <path>`.
+- The resolved plan path is echoed to stderr before the review runs so you can verify the selection.
 
 Foreground flow:
 - Run:

@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -245,15 +246,19 @@ const REVIEW_TEMPLATE_MAP = new Map([
   ["PR Review", "pr-review"]
 ]);
 
-function buildCustomReviewPrompt(context, focusText, reviewName) {
+function buildCustomReviewPrompt(context, focusText, reviewName, planFile = null) {
   const templateName = REVIEW_TEMPLATE_MAP.get(reviewName) ?? "adversarial-review";
   const template = loadPromptTemplate(ROOT_DIR, templateName);
+  const planFileContent = planFile
+    ? `Path: ${planFile.path}\n\n${planFile.content}`
+    : "";
   return interpolateTemplate(template, {
     REVIEW_KIND: reviewName,
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
-    REVIEW_INPUT: context.content
+    REVIEW_INPUT: context.content,
+    PLAN_FILE_CONTENT: planFileContent
   });
 }
 
@@ -373,6 +378,7 @@ async function executeReviewRun(request) {
   });
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
+  const planFile = request.planFile ?? null;
   if (reviewName === "Review") {
     const reviewTarget = validateNativeReviewRequest(target, focusText);
     const result = await runAppServerReview(request.cwd, {
@@ -415,7 +421,7 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildCustomReviewPrompt(context, focusText, reviewName);
+  const prompt = buildCustomReviewPrompt(context, focusText, reviewName, planFile);
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
@@ -697,9 +703,96 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
 }
 
+const PLAN_SIZE_LIMIT = 200 * 1024;
+
+function resolvePlanFile(cwd, focusText) {
+  const home = os.homedir();
+  const conductorCwd = path.resolve(home, ".claude");
+  const isConductorCwd = path.resolve(cwd) === conductorCwd;
+
+  // Conductor mode (cwd == ~/.claude) uses ~/.claude/plans/ exclusively.
+  // Project mode uses {cwd}/.claude/plans/ exclusively.
+  // Each mode has a single canonical plans directory to prevent nested-dir shadowing.
+  const plansDir = isConductorCwd
+    ? path.join(conductorCwd, "plans")
+    : path.join(cwd, ".claude", "plans");
+  // Resolve symlinks for reliable path-safety comparison (e.g., /tmp → /private/tmp on macOS)
+  const realPlansDir = fs.existsSync(plansDir) ? fs.realpathSync(plansDir) : plansDir;
+
+  function listMarkdownEntries(dir) {
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+      .filter((f) => f.endsWith(".md"))
+      .map((f) => ({ abs: path.join(dir, f), f }))
+      .sort((a, b) => a.f.localeCompare(b.f));
+  }
+
+  function resolveCandidate(p) {
+    if (!fs.existsSync(p)) return null;
+    return p;
+  }
+
+  let candidate;
+  if (focusText) {
+    // Explicit --plan <value>: absolute path, relative path, or bare filename.
+    if (path.isAbsolute(focusText)) {
+      candidate = resolveCandidate(focusText);
+    } else if (focusText.includes(path.sep) || focusText.includes("/")) {
+      candidate = resolveCandidate(path.resolve(cwd, focusText));
+    } else {
+      candidate = resolveCandidate(path.join(plansDir, focusText));
+    }
+    if (!candidate) {
+      throw new Error(
+        `Plan file not found: ${focusText}. Expected under ${plansDir} or as an absolute path.`
+      );
+    }
+  } else {
+    // Auto-select: exactly one .md file must exist. Fail-closed on 0 or 2+ to avoid silent
+    // mis-selection by mtime heuristics.
+    const entries = listMarkdownEntries(plansDir);
+    if (entries.length === 0) {
+      throw new Error(
+        `No plan file found in ${plansDir}. Create a plan there or pass --plan <path>.`
+      );
+    }
+    if (entries.length > 1) {
+      const names = entries.map((e) => e.f).join(", ");
+      throw new Error(
+        `Multiple plan files found in ${plansDir} (${names}). ` +
+        `Use --plan <path> to select one explicitly.`
+      );
+    }
+    candidate = entries[0].abs;
+  }
+
+  const resolved = fs.realpathSync(candidate);
+  const isSafe = resolved === realPlansDir || resolved.startsWith(realPlansDir + path.sep);
+  if (!isSafe) {
+    throw new Error(
+      `Plan file path is outside allowed directories: ${resolved}. ` +
+      `Plans must live under ${plansDir}.`
+    );
+  }
+  if (!resolved.endsWith(".md")) {
+    throw new Error(`Plan file must be a .md file: ${resolved}`);
+  }
+
+  const stat = fs.statSync(resolved);
+  if (stat.size === 0) {
+    throw new Error(`Plan file is empty: ${resolved}`);
+  }
+  if (stat.size > PLAN_SIZE_LIMIT) {
+    throw new Error(`Plan file too large (${stat.size} bytes > ${PLAN_SIZE_LIMIT / 1024} KB limit): ${resolved}`);
+  }
+
+  const content = fs.readFileSync(resolved, "utf8");
+  return { path: resolved, content };
+}
+
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "plan"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -709,6 +802,22 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const focusText = positionals.join(" ").trim();
+
+  let planFile = null;
+  if (config.reviewName === "Plan Review") {
+    // Detect likely misuse: positional text shaped like a path (deprecated positional API).
+    if (focusText && (focusText.endsWith(".md") || focusText.includes("/") || focusText.includes(path.sep))) {
+      throw new Error(
+        `Positional text "${focusText}" looks like a plan path. ` +
+        `Use --plan <path> to select a plan. Positional text is review focus only.`
+      );
+    }
+    // focusText is always review focus text. Use --plan <path> to select a specific plan.
+    planFile = resolvePlanFile(cwd, options.plan ?? null);
+    // Surface the resolved plan path so users can verify what will be reviewed.
+    process.stderr.write(`[plan-review] Selected plan: ${planFile.path}\n`);
+  }
+
   const target = resolveReviewTarget(cwd, {
     base: options.base,
     scope: options.scope
@@ -733,6 +842,7 @@ async function handleReviewCommand(argv, config) {
         scope: options.scope,
         model: options.model,
         focusText,
+        planFile,
         reviewName: config.reviewName,
         onProgress: progress
       }),
